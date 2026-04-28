@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+# Скрипт для исправления .env файла
+
+env_content = """# ─── Telegram ────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN=8134965474:AAGLK-vVVBzD8ijVkHBf-e_eYHyeYBIzjr4
+ADMIN_IDS=8401856959
+
+# Ваш @username без @ — для кнопки «Поддержка»
+# Например: SUPPORT_USERNAME=my_support_bot   или  SUPPORT_USERNAME=yourusername
+SUPPORT_USERNAME=baglaaai   # <-- ЗАМЕНИТЕ на свой @username!
+
+# ─── YooKassa ─────────────────────────────────────────────────────────────────
+YOOKASSA_ACCOUNT_ID=your_shop_id
+YOOKASSA_API_KEY=your_secret_key
+YOOKASSA_RETURN_URL=https://t.me/your_bot_username
+
+# ─── Сервер 1 (3x-ui) ────────────────────────────────────────────────────────
+SERVER1_NAME=🌍 Сервер 1
+SERVER1_PANEL_URL=http://cloudimagesite.site:2053/Wvh39gur3RV/
+SERVER1_PANEL_USER=baglaaai
+SERVER1_PANEL_PASS=Bas_Andy/2407
+SERVER1_INBOUND_ID=2
+SERVER1_HOST=cloudimagesite.site
+SERVER1_PORT=443
+SERVER1_SNI=www.microsoft.com
+SERVER1_PBK=JiU0E9wyKBMM6KA_GytTGonaqGgX3Bes-0_gI6SRJlA
+SERVER1_SID=6a17461af745
+SERVER1_FP=chrome
+
+# ─── Сервер 2 (закомментирован — включите когда будет готов) ─────────────────
+# SERVER2_NAME=🌍 Сервер 2
+# SERVER2_PANEL_URL=https://89.208.97.100:2053
+# SERVER2_PANEL_USER=baglaaai
+# SERVER2_PANEL_PASS=Bas_Andy/2407
+# SERVER2_INBOUND_ID=1
+# SERVER2_HOST=89.208.97.100
+# SERVER2_PORT=443
+# SERVER2_SNI=www.microsoft.com
+# SERVER2_PBK=YWPMzcKalx8jkblrCEbw1SH5G3a6ppEMad5TLAF7kS4
+# SERVER2_SID=9f76951fe6
+# SERVER2_FP=chrome
+
+# ─── Настройки ───────────────────────────────────────────────────────────────
+TRIAL_DAYS=7
+SUBSCRIPTION_PRICE=100
+SUBSCRIPTION_DAYS=30
+DB_PATH=vpn_bot.db
+"""
+
+with open('.env', 'w', encoding='utf-8') as f:
+    f.write(env_content)
+
+print("Файл .env перезаписан без переносов строк")

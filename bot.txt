@@ -1,0 +1,894 @@
+"""
+bot.py — Pythoon VPN Telegram Bot
+Запуск: python bot.py
+"""
+
+import asyncio
+import logging
+import os
+import io
+from datetime import datetime
+
+from dotenv import load_dotenv
+
+# Глобальный logger
+logger = logging.getLogger(__name__)
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+from telegram.constants import ParseMode
+
+load_dotenv()
+
+import database as db
+import payments as pay
+import xray
+from xray import provision_user_on_server, remove_user_from_server, get_server_by_id
+from qr import make_qr_bytes
+from helpers import fmt_date, device_icon
+import texts as T
+
+# Глобальные переменные
+TRIAL_DAYS   = int(os.getenv("TRIAL_DAYS", "7"))
+SUB_DAYS     = int(os.getenv("SUBSCRIPTION_DAYS", "30"))
+ADMIN_IDS    = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+SUPPORT_LINK = os.getenv("SUPPORT_LINK", f"https://t.me/{ADMIN_IDS[0]}")
+
+def main():
+    logging.basicConfig(
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        level=logging.INFO,
+    )
+    
+    logger.info("🐍 Pythoon VPN Bot запущен!")
+    
+    # Очищаем базу данных для чистого старта
+    db.clear_db()
+    db.init_db()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Клавиатуры
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def main_keyboard(user_id: int):
+    # Проверяем, есть ли у пользователя уже созданный конфиг
+    user_clients = db.get_user_clients(user_id)
+    
+    keyboard = []
+    
+    # Если конфига еще нет, показываем кнопку создания
+    if not user_clients:
+        keyboard.append([InlineKeyboardButton("🚀 Создать конфиг", callback_data="generate_config")])
+    
+    # Основные кнопки
+    keyboard.append([
+        InlineKeyboardButton("💳 Оплатить", callback_data="pay"),
+        InlineKeyboardButton("📱 Устройства", callback_data="devices"),
+    ])
+    
+    # Если есть конфиг - показываем замену ссылки
+    if has_config:
+        keyboard.append([InlineKeyboardButton("🔄 Заменить ссылку", callback_data="replace_link")])
+    
+    keyboard.append([InlineKeyboardButton("🛠 Поддержка", url=f"https://t.me/{ADMIN_IDS[0]}")])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+
+def back_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀️ Назад", callback_data="back_main")]
+    ])
+
+
+def admin_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Список клиентов", callback_data="admin_clients")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="admin_settings")],
+    ])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Профиль
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def send_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
+    """Показывает главный экран с профилем и конфигами."""
+    user_id = update.effective_user.id
+    
+    # Проверяем, админ ли пользователь
+    if user_id in ADMIN_IDS:
+        await send_admin_profile(update, context, edit)
+        return
+    
+    user = db.get_user(user_id)
+    clients = db.get_clients_for_user(user_id)
+
+    expires = fmt_date(user["expires_at"]) if user else "—"
+    active = db.is_subscription_active(user_id)
+
+    text = T.PROFILE_TEMPLATE.format(
+        user_id=user_id,
+        expires=f"{expires} {'✅' if active else '❌'}",
+    )
+
+    if not active and (not user or not user["trial_used"]):
+        text += "\n" + T.NO_SUBSCRIPTION
+
+    # Конфиги
+    config_lines = []
+    for c in clients:
+        srv = get_server_by_id(c["server_id"])
+        srv_name = srv.name if srv else f"Сервер {c['server_id']}"
+        link = c["vless_link"] or "—"
+        config_lines.append(
+            f"🌐 *{srv_name}*\n`{link}`"
+        )
+
+    if config_lines:
+        text += "\n\n" + "\n\n".join(config_lines)
+
+    text += "\n\nСпасибо за сотрудничество 🙏"
+
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard(user_id)
+        )
+    else:
+        msg = update.message or update.callback_query.message
+        await msg.reply_text(
+            text, parse_mode=ParseMode.MARKDOWN, reply_markup=main_keyboard(user_id)
+        )
+
+
+async def send_admin_profile(update: Update, context: ContextTypes.DEFAULT_TYPE, edit: bool = False):
+    """Показывает админский интерфейс."""
+    user_id = update.effective_user.id
+    
+    text = f"👑 *Админ панель*\n\n"
+    text += f"🆔 Ваш ID: `{user_id}`\n"
+    
+    # Проверяем конфиги админа
+    clients = db.get_clients_for_user(user_id)
+    has_config = len(clients) > 0
+    
+    if has_config:
+        text += f"\n🔑 *Ваши конфиги:*\n"
+        for i, client in enumerate(clients, 1):
+            srv = get_server_by_id(client["server_id"])
+            srv_name = srv.name if srv else f"Сервер {client['server_id']}"
+            text += f"{i}. {srv_name}\n"
+        
+        text += f"\n💡 *Действия:*\n"
+        text += "• /configs - получить QR-коды\n"
+        text += "• Устройства - управление устройствами\n"
+    else:
+        text += f"\n🔑 *Конфиги не созданы*\n"
+        text += "Нажмите 'Создать конфиг' для начала работы\n"
+    
+    # Получаем статистику
+    with db.get_conn() as conn:
+        total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        active_users = conn.execute("SELECT COUNT(*) FROM users WHERE expires_at > datetime('now')").fetchone()[0]
+        total_clients = conn.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
+    
+    text += f"\n📊 *Статистика:*\n"
+    text += f"• Всего пользователей: {total_users}\n"
+    text += f"• Активных подписок: {active_users}\n"
+    text += f"• Всего конфигов: {total_clients}\n"
+
+    # Клавиатура для админа
+    keyboard = []
+    if not has_config:
+        keyboard.append([InlineKeyboardButton("🔑 Создать конфиг", callback_data="generate_config")])
+    
+    keyboard.extend([
+        [InlineKeyboardButton("📱 Устройства", callback_data="devices")],
+        [InlineKeyboardButton("👥 Список клиентов", callback_data="admin_clients")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="admin_settings")]
+    ])
+
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        msg = update.message or update.callback_query.message
+        await msg.reply_text(
+            text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+
+async def cb_admin_clients(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает список клиентов с кнопками управления."""
+    query = update.callback_query
+    await query.answer()
+    
+    with db.get_conn() as conn:
+        rows = conn.execute("""
+            SELECT u.user_id, u.username, u.expires_at, u.trial_used,
+                   COUNT(c.id) as client_count
+            FROM users u 
+            LEFT JOIN clients c ON u.user_id = c.user_id 
+            ORDER BY u.created_at DESC 
+            LIMIT 20
+        """).fetchall()
+    
+    if not rows:
+        await query.edit_message_text("📭 Клиентов нет.", reply_markup=back_keyboard())
+        return
+    
+    text = "👥 *Список клиентов:*\n\n"
+    buttons = []
+    
+    for row in rows:
+        active = db.is_subscription_active(row["user_id"])
+        status = "✅" if active else "❌"
+        username = f"@{row['username']}" if row['username'] else f"ID:{row['user_id']}"
+        
+        text += f"{status} *{username}* — {fmt_date(row['expires_at'])} ({row['client_count']} конфигов)\n"
+        
+        # Кнопки для каждого клиента
+        client_buttons = [
+            InlineKeyboardButton(
+                f"📱 Выдать конфиг",
+                callback_data=f"admin_grant:{row['user_id']}"
+            ),
+            InlineKeyboardButton(
+                f"🔄 Продлить на 30дн",
+                callback_data=f"admin_extend:{row['user_id']}"
+            ),
+            InlineKeyboardButton(
+                f"ℹ️ Инфо",
+                callback_data=f"admin_info:{row['user_id']}"
+            )
+        ]
+        buttons.append(client_buttons)
+    
+    buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="back_main")])
+    
+    await query.edit_message_text(
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def cb_admin_grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выдает конфиги клиенту."""
+    query = update.callback_query
+    await query.answer()
+    user_id = int(query.data.split(":", 1)[1])
+    
+    try:
+        # Проверяем, есть ли уже конфиги
+        existing_clients = db.get_clients_for_user(user_id)
+        if existing_clients:
+            await query.answer("❌ У клиента уже есть конфиги!", show_alert=True)
+            return
+        
+        # Создаём конфиги на обоих серверах
+        for server in xray.SERVERS:
+            c_uuid, email, vless = await provision_user_on_server(server, user_id, server.id)
+            db.add_client(user_id, server.id, c_uuid, email, vless, device_name="Основной конфиг")
+        
+        await query.answer("✅ Конфиги выданы!", show_alert=True)
+        await cb_admin_clients(update, context)
+        
+    except Exception as e:
+        logger.exception(f"Admin grant error for {user_id}: {e}")
+        await query.answer("❌ Ошибка выдачи конфигов", show_alert=True)
+
+
+async def cb_admin_extend_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Продлевает подписку клиенту вручную (без оплаты)."""
+    query = update.callback_query
+    await query.answer()
+    user_id = int(query.data.split(":", 1)[1])
+    
+    try:
+        new_exp = db.extend_subscription(user_id, SUB_DAYS)
+        await query.answer(f"✅ Подписка продлена до {fmt_date(new_exp)}", show_alert=True)
+        await cb_admin_clients(update, context)
+        
+        # Уведомляем клиента
+        try:
+            await context.bot.send_message(
+                user_id,
+                f"🎉 Твоя подписка продлена на 30 дней!\nАктивна до: *{fmt_date(new_exp)}*",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception:
+            pass
+            
+    except Exception as e:
+        logger.exception(f"Admin extend error for {user_id}: {e}")
+        await query.answer("❌ Ошибка продления подписки", show_alert=True)
+
+
+async def cb_admin_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает детальную информацию о клиенте."""
+    query = update.callback_query
+    await query.answer()
+    user_id = int(query.data.split(":", 1)[1])
+    
+    user = db.get_user(user_id)
+    if not user:
+        await query.answer("❌ Клиент не найден", show_alert=True)
+        return
+    
+    clients = db.get_clients_for_user(user_id)
+    active = db.is_subscription_active(user_id)
+    
+    text = f"👤 *Информация о клиенте*\n\n"
+    text += f"🆔 ID: `{user_id}`\n"
+    text += f"👁 Username: @{user['username'] or '—'}\n"
+    text += f"📅 Подписка до: *{fmt_date(user['expires_at'])}* {'✅' if active else '❌'}\n"
+    text += f"🎁 Триал использован: {'да' if user['trial_used'] else 'нет'}\n"
+    text += f"🔑 Конфигов: {len(clients)}\n"
+    
+    if clients:
+        text += f"\n📱 *Конфиги:*\n"
+        for i, c in enumerate(clients, 1):
+            srv = get_server_by_id(c["server_id"])
+            srv_name = srv.name if srv else f"Сервер {c['server_id']}"
+            text += f"{i}. {srv_name} - {'✅' if c['vless_link'] else '❌'}\n"
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("◀️ Назад к списку", callback_data="admin_clients")]
+    ])
+    
+    await query.edit_message_text(
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /start
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    username = update.effective_user.username or ""
+
+    db.upsert_user(user_id, username)
+    user = db.get_user(user_id)
+    clients = db.get_clients_for_user(user_id)
+
+    # Приветственное сообщение только при первом заходе
+    if not user["trial_used"]:
+        await update.message.reply_text(T.WELCOME, parse_mode=ParseMode.MARKDOWN)
+
+    # Если нет активной подписки и нет конфигов — активируем триал
+    if not user["trial_used"] and not clients:
+        await _activate_trial(update, context, user_id)
+        return
+
+    await send_profile(update, context)
+
+
+async def _activate_trial(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Активирует триал без создания конфигов."""
+    msg = await (update.message or update.callback_query.message).reply_text(
+        "⏳ Активируем пробный период, подожди секунду..."
+    )
+
+    try:
+        db.activate_trial(user_id, TRIAL_DAYS)
+
+        await msg.delete()
+        await (update.message or update.callback_query.message).reply_text(
+            T.TRIAL_ACTIVATED, parse_mode=ParseMode.MARKDOWN
+        )
+        await send_profile(update, context)
+
+    except Exception as e:
+        logger.exception(f"Trial activation failed for {user_id}: {e}")
+        await msg.edit_text("❌ Не удалось активировать триал. Напиши в поддержку.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Callback: Назад
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def cb_back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await send_profile(update, context, edit=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Callback: Оплатить
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def cb_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    try:
+        payment_id, url = pay.create_payment(user_id)
+        # Сохраняем payment_id в контекст для проверки
+        context.user_data["pending_payment_id"] = payment_id
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Перейти к оплате", url=url)],
+            [InlineKeyboardButton("✅ Проверить оплату", callback_data=f"check_pay:{payment_id}")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
+        ])
+        await query.edit_message_text(
+            T.PAYMENT_CREATED, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+        )
+    except Exception as e:
+        logger.exception(f"Payment creation error for {user_id}: {e}")
+        await query.edit_message_text("❌ Ошибка при создании платежа. Попробуй позже.")
+
+
+async def cb_check_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    payment_id = query.data.split(":", 1)[1]
+
+    try:
+        if pay.confirm_if_succeeded(payment_id):
+            # Продлеваем подписку
+            new_exp = db.extend_subscription(user_id, SUB_DAYS)
+
+            await query.edit_message_text(
+                T.PAYMENT_OK, parse_mode=ParseMode.MARKDOWN
+            )
+            await send_profile(update, context)
+        else:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Проверить ещё раз", callback_data=f"check_pay:{payment_id}")],
+                [InlineKeyboardButton("◀️ Назад", callback_data="back_main")],
+            ])
+            await query.edit_message_text(
+                T.PAYMENT_PENDING, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+            )
+    except Exception as e:
+        logger.exception(f"Payment check error: {e}")
+        await query.edit_message_text(T.PAYMENT_ERROR)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Callback: Устройства
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def cb_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    devices = db.get_devices_for_user(user_id)
+    
+    # Если нет конфига - предлагаем создать его
+    if not devices:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔑 Создать конфиг", callback_data="generate_config")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="back_main")]
+        ])
+        await query.edit_message_text(
+            "📱 *Устройства*\n\nСначала создайте конфиг, чтобы добавлять устройства.", 
+            parse_mode=ParseMode.MARKDOWN, 
+            reply_markup=keyboard
+        )
+        return
+
+    text = "📱 *Устройства*\n\n"
+    buttons = []
+    
+    # Показываем только устройства с именами (не "Основной конфиг")
+    named_devices = [dev for dev in devices if dev.get("device_name") != "Основной конфиг"]
+    
+    if named_devices:
+        for i, dev in enumerate(named_devices, 1):
+            srv = get_server_by_id(dev["server_id"])
+            srv_name = srv.name if srv else f"Сервер {dev['server_id']}"
+            icon = device_icon(dev["device_name"])
+            text += f"{i}. {icon} *{dev['device_name']}* — {srv_name}\n"
+            buttons.append([
+                InlineKeyboardButton(
+                    f"❌ Отвязать: {dev['device_name']}",
+                    callback_data=f"del_device:{dev['id']}"
+                )
+            ])
+    else:
+        text += "📱 Устройств пока нет. Добавьте первое устройство!\n\n"
+    
+    # Кнопка добавления устройства (безлимит для админов)
+    is_admin = user_id in ADMIN_IDS
+    device_limit = 999 if is_admin else 5
+    
+    if len(named_devices) < device_limit:
+        buttons.append([InlineKeyboardButton("➕ Добавить устройство", callback_data="add_device")])
+    else:
+        if not is_admin:
+            text += "⚠️ Достигнут лимит устройств (5)\n"
+    
+    buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="back_main")])
+    
+    await query.edit_message_text(
+        text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def cb_del_device(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    device_id = int(query.data.split(":", 1)[1])
+
+    db.delete_device(device_id, user_id)
+    await cb_devices(update, context)
+
+
+async def cb_generate_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Генерирует основной конфиг (один раз за подписку)."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    # Проверяем, нет ли уже основного конфига
+    devices = db.get_devices_for_user(user_id)
+    has_main_config = any(dev["device_name"] == "Основной конфиг" for dev in devices)
+    
+    if has_main_config:
+        await query.answer("❌ У вас уже есть основной конфиг!", show_alert=True)
+        return
+
+    # Проверяем подписку (админам не нужно)
+    if user_id not in ADMIN_IDS and not db.is_subscription_active(user_id):
+        await query.answer("❌ Подписка не активна.", show_alert=True)
+        return
+
+    await query.edit_message_text("⏳ Создаём основной конфиг...")
+
+    try:
+        # Создаём основной конфиг на всех серверах
+        for server in xray.SERVERS:
+            c_uuid, email, vless = await provision_user_on_server(server, user_id, server.id)
+            db.add_client(user_id, server.id, c_uuid, email, vless, device_name="Основной конфиг")
+
+        await query.message.reply_text("✅ Основной конфиг создан! Нажми /configs чтобы получить QR-коды.")
+        await send_profile(update, context)
+    except Exception as e:
+        logger.exception(f"Generate config error for {user_id}: {e}")
+        await query.message.reply_text("❌ Не удалось создать конфиг. Напиши в поддержку.")
+
+
+async def cb_add_device(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает инструкцию и включает режим ожидания названия устройства."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    devices = db.get_devices_for_user(user_id)
+    # Считаем только те, что уже названы (кроме основного)
+    named_devices = [dev for dev in devices if dev["device_name"] != "Основной конфиг"]
+    
+    # 1. Проверка лимита
+    is_admin = user_id in ADMIN_IDS
+    device_limit = 999 if is_admin else 5
+    
+    if len(named_devices) >= device_limit:
+        msg = "❌ Лимит (5 устройств) исчерпан!" if not is_admin else "❌ Лимит превышен!"
+        await query.answer(msg, show_alert=True)
+        return
+
+    # 2. Проверка, сгенерирован ли вообще ключ
+    main_config = next((dev for dev in devices if dev["device_name"] == "Основной конфиг"), None)
+    if not main_config:
+        await query.answer("❌ Сначала создайте основной конфиг!", show_alert=True)
+        return
+
+    # 3. Проверка подписки
+    if not is_admin and not db.is_subscription_active(user_id):
+        await query.answer("❌ Подписка не активна.", show_alert=True)
+        return
+
+    # 4. Формируем сообщение
+    srv = xray.get_server_by_id(main_config["server_id"])
+    server_name = srv.name if srv else "Сервер"
+
+    text = (
+        f"📱 *Добавление устройства*\n\n"
+        f"🔗 *Ваша ссылка для {server_name}:*\n`{main_config['vless_link']}`\n\n"
+        f"1. Скопируйте ссылку или отсканируйте QR ниже.\n"
+        f"2. Подключитесь в приложении.\n\n"
+        f"✍️ *А теперь напишите название для этого устройства:* \n"
+        f"_(например: iPhone 14 или Ноутбук)_"
+    )
+
+    await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN)
+    
+    # Отправляем QR
+    try:
+        qr_bytes = make_qr_bytes(main_config['vless_link'])
+        await query.message.reply_photo(qr_bytes, caption="📷 Ваш QR-код")
+    except Exception as e:
+        logger.error(f"Ошибка QR: {e}")
+    
+    # ВКЛЮЧАЕМ РЕЖИМ ОЖИДАНИЯ
+    # Запоминаем не просто True, а ID конфига, к которому привяжем имя
+    context.user_data["waiting_for_device_name"] = True
+    context.user_data["main_client_id"] = main_config["id"]
+
+
+async def handle_device_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает название устройства от пользователя."""
+    user_id = update.effective_user.id
+    
+    # Проверяем, ожидаем ли мы название устройства
+    if not context.user_data.get("waiting_device_name"):
+        return
+    
+    device_name = update.message.text.strip()
+    
+    # Проверяем длину названия
+    if len(device_name) < 2 or len(device_name) > 30:
+        await update.message.reply_text("❌ Название должно быть от 2 до 30 символов. Попробуйте еще раз:")
+        return
+    
+    # Проверяем, нет ли уже такого устройства
+    devices = db.get_devices_for_user(user_id)
+    existing_names = [dev["device_name"] for dev in devices if dev["device_name"] != "Основной конфиг"]
+    
+    if device_name in existing_names:
+        await update.message.reply_text(f"❌ Устройство '{device_name}' уже существует. Придумайте другое название:")
+        return
+    
+    try:
+        # Получаем основной конфиг
+        main_config = next(dev for dev in devices if dev["device_name"] == "Основной конфиг")
+        
+        # Добавляем устройство с теми же данными, но с новым названием
+        db.add_client(
+            user_id, 
+            main_config["server_id"], 
+            main_config["client_uuid"], 
+            main_config["email"], 
+            main_config["vless_link"], 
+            device_name=device_name
+        )
+        
+        # Очищаем состояние ожидания
+        context.user_data["waiting_device_name"] = False
+        
+        await update.message.reply_text(f"✅ Устройство '{device_name}' успешно добавлено!")
+        
+        # Показываем обновленный список устройств
+        await cb_devices(update, context)
+        
+    except Exception as e:
+        logger.exception(f"Error adding device {device_name}: {e}")
+        await update.message.reply_text("❌ Не удалось добавить устройство. Попробуйте еще раз:")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Callback: Заменить ссылку
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def cb_replace_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+
+    if not db.is_subscription_active(user_id):
+        await query.answer("❌ Подписка не активна.", show_alert=True)
+        return
+
+    await query.edit_message_text("⏳ Пересоздаём ссылки...")
+
+    try:
+        clients = db.get_clients_for_user(user_id)
+        for c in clients:
+            srv = get_server_by_id(c["server_id"])
+            if not srv:
+                continue
+            # Удаляем старого клиента
+            await remove_user_from_server(srv, c["uuid"])
+            # Создаём нового
+            new_uuid, email, vless = await provision_user_on_server(srv, user_id, srv.id)
+            db.delete_client(user_id, srv.id)
+            db.add_client(user_id, srv.id, new_uuid, email, vless, device_name="Основной конфиг")
+
+        await query.message.reply_text(T.LINK_REPLACED, parse_mode=ParseMode.MARKDOWN)
+        await send_profile(update, context)
+    except Exception as e:
+        logger.exception(f"Replace link error for {user_id}: {e}")
+        await query.message.reply_text("❌ Ошибка при замене ссылок. Напиши в поддержку.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Команда /configs — отправляет QR-коды
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def cmd_configs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not db.is_subscription_active(user_id):
+        await update.message.reply_text("❌ Подписка не активна. Нажми 💳 Оплатить.")
+        return
+
+    clients = db.get_clients_for_user(user_id)
+    if not clients:
+        await update.message.reply_text("У тебя нет конфигов. Нажми /start.")
+        return
+
+    for c in clients:
+        srv = get_server_by_id(c["server_id"])
+        srv_name = srv.name if srv else f"Сервер {c['server_id']}"
+        link = c["vless_link"]
+        if not link:
+            continue
+        qr = make_qr_bytes(link)
+        caption = (
+            f"🌐 *{srv_name}*\n\n"
+            f"Вставь в HAPP или любой VLESS-клиент:\n"
+            f"`{link}`"
+        )
+        await update.message.reply_photo(
+            photo=io.BytesIO(qr),
+            caption=caption,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Админ-команды
+# ─────────────────────────────────────────────────────────────────────────────
+
+def admin_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id not in ADMIN_IDS:
+            await update.message.reply_text("⛔️ Нет доступа.")
+            return
+        return await func(update, context)
+    return wrapper
+
+
+@admin_only
+async def cmd_admin_extend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /extend <user_id>
+    Ручное продление подписки на 30 дней.
+    """
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Использование: /extend <user_id>")
+        return
+
+    target_id = int(args[0])
+    user = db.get_user(target_id)
+    if not user:
+        await update.message.reply_text(
+            T.ADMIN_USER_NOT_FOUND.format(user_id=target_id)
+        )
+        return
+
+    new_exp = db.extend_subscription(target_id, SUB_DAYS)
+    await update.message.reply_text(
+        T.ADMIN_EXTENDED.format(user_id=target_id, expires=fmt_date(new_exp)),
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    # Уведомляем пользователя
+    try:
+        await context.bot.send_message(
+            target_id,
+            f"🎉 Твоя подписка продлена на 30 дней!\nАктивна до: *{fmt_date(new_exp)}*",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        pass
+
+
+@admin_only
+async def cmd_admin_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /userinfo <user_id>
+    Информация о пользователе.
+    """
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Использование: /userinfo <user_id>")
+        return
+
+    target_id = int(args[0])
+    user = db.get_user(target_id)
+    if not user:
+        await update.message.reply_text(f"❌ Пользователь {target_id} не найден.")
+        return
+
+    clients = db.get_clients_for_user(target_id)
+    active = db.is_subscription_active(target_id)
+
+    text = (
+        f"👤 Пользователь: @{user['username'] or '—'}\n"
+        f"🆔 ID: `{target_id}`\n"
+        f"📅 До: *{fmt_date(user['expires_at'])}* {'✅' if active else '❌'}\n"
+        f"🔑 Конфигов: {len(clients)}\n"
+        f"🎁 Триал использован: {'да' if user['trial_used'] else 'нет'}"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+@admin_only
+async def cmd_admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/listusers — список всех пользователей."""
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT user_id, username, expires_at FROM users ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+
+    if not rows:
+        await update.message.reply_text("Пользователей нет.")
+        return
+
+    lines = ["👥 *Последние 50 пользователей:*\n"]
+    for r in rows:
+        active = db.is_subscription_active(r["user_id"])
+        lines.append(
+            f"• `{r['user_id']}` @{r['username'] or '—'} — {fmt_date(r['expires_at'])} {'✅' if active else '❌'}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Запуск
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    from helpers import fmt_date as _  # noqa
+
+    db.init_db()
+    pay.init_yookassa()
+    xray.SERVERS = xray.load_servers()
+
+    token = os.getenv("TELEGRAM_TOKEN")
+    app = Application.builder().token(token).build()
+
+    # Команды
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("configs", cmd_configs))
+    app.add_handler(CommandHandler("extend", cmd_admin_extend))
+    app.add_handler(CommandHandler("userinfo", cmd_admin_info))
+    app.add_handler(CommandHandler("listusers", cmd_admin_list))
+    
+    # Обработчик текстовых сообщений для названий устройств
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_device_name))
+
+    # Колбэки
+    app.add_handler(CallbackQueryHandler(cb_back_main,    pattern="^back_main$"))
+    app.add_handler(CallbackQueryHandler(cb_pay,          pattern="^pay$"))
+    app.add_handler(CallbackQueryHandler(cb_check_pay,    pattern="^check_pay:"))
+    app.add_handler(CallbackQueryHandler(cb_devices,      pattern="^devices$"))
+    app.add_handler(CallbackQueryHandler(cb_del_device,   pattern="^del_device:"))
+    app.add_handler(CallbackQueryHandler(cb_generate_config, pattern="^generate_config$"))
+    app.add_handler(CallbackQueryHandler(cb_add_device,   pattern="^add_device$"))
+    app.add_handler(CallbackQueryHandler(cb_replace_link, pattern="^replace_link$"))
+    
+    # Админские обработчики
+    app.add_handler(CallbackQueryHandler(cb_admin_clients, pattern="^admin_clients$"))
+    app.add_handler(CallbackQueryHandler(cb_admin_grant,   pattern="^admin_grant:"))
+    app.add_handler(CallbackQueryHandler(cb_admin_extend_manual, pattern="^admin_extend:"))
+    app.add_handler(CallbackQueryHandler(cb_admin_info,    pattern="^admin_info:"))
+
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
